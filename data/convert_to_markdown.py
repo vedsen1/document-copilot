@@ -94,7 +94,9 @@ def main() -> None:
     args = parse_args()
 
     try:
+        # pyrefly: ignore [missing-import]
         from docling.datamodel.base_models import InputFormat
+        # pyrefly: ignore [missing-import]
         from docling.document_converter import DocumentConverter
     except ImportError:
         sys.exit(
