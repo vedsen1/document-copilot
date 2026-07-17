@@ -1,4 +1,4 @@
-﻿"""
+"""
 Convert SEC 10-K HTML filings -> Markdown using docling.
 
 Reads downloads/manifest.json, converts each .htm file, and writes the result
@@ -62,7 +62,7 @@ def output_path(local_path: str) -> Path:
     return MARKDOWN_DIR / rel.parent / (rel.stem + ".md")
 
 
-def convert_filing(html_path: Path, md_path: Path, converter) -> bool:
+def convert_filing(html_path: Path, md_path: Path, converter, input_format) -> bool:
     """Convert one HTML file to Markdown. Returns True on success."""
     if not html_path.exists():
         print(f"  [SKIP] Source file missing: {html_path}")
@@ -77,7 +77,7 @@ def convert_filing(html_path: Path, md_path: Path, converter) -> bool:
 
         result = converter.convert_string(
             html_content,
-            format="html",
+            format=input_format,
             name=html_path.name,
         )
         markdown = result.document.export_to_markdown()
@@ -94,6 +94,7 @@ def main() -> None:
     args = parse_args()
 
     try:
+        from docling.datamodel.base_models import InputFormat
         from docling.document_converter import DocumentConverter
     except ImportError:
         sys.exit(
@@ -136,7 +137,7 @@ def main() -> None:
             continue
 
         t0 = time.monotonic()
-        ok = convert_filing(html_path, md_path, converter)
+        ok = convert_filing(html_path, md_path, converter, InputFormat.HTML)
         elapsed = time.monotonic() - t0
 
         if ok:
