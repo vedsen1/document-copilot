@@ -90,10 +90,11 @@ Goal: end-to-end chat UI streaming from FastAPI, no real retrieval yet.
 
 **Frontend**
 
-- [x] React Router: login, chat list, chat thread routes
-- [x] AI SDK chat primitives pointed at `POST /chat/stream` with Supabase bearer token
-- [x] Thread sidebar (past conversations)
-- [x] Basic message list + input + streaming indicator
+- [x] React Router: `/chat` (layout + sidebar) and `/chat/:threadId` (thread) routes
+- [x] Native SSE reader pointed at `POST /chat/stream` with Supabase bearer token
+- [x] Thread sidebar (past conversations, active highlight, relative timestamps)
+- [x] Message list with user/assistant bubbles + streaming indicator (dots → cursor)
+- [x] Auto-growing textarea input, Enter-to-send, disabled during streaming
 - [x] Verify: create thread, send message, see streamed stub response, reload and see history
 
 ---
