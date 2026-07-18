@@ -1,33 +1,49 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
-import { AuthProvider } from '@/context/AuthContext'
-import ProtectedRoute from '@/components/ProtectedRoute'
-import LoginPage from '@/pages/LoginPage'
-import SignUpPage from '@/pages/SignUpPage'
-import ChatLayout from '@/pages/chat/ChatLayout'
-import ThreadPage from '@/pages/chat/ThreadPage'
-import ChatLanding from '@/pages/chat/ChatLanding'
 
-export default function App() {
+import { ChatLayout } from '@/components/chat/ChatLayout'
+import { ProtectedRoute } from '@/components/ProtectedRoute'
+import { PublicRoute } from '@/components/PublicRoute'
+import { ChatEmptyPage } from '@/pages/chat/ChatEmptyPage'
+import { ChatThreadPage } from '@/pages/chat/ChatThreadPage'
+import { Login } from '@/pages/Login'
+import { SignUp } from '@/pages/SignUp'
+
+function App() {
   return (
     <BrowserRouter>
-      <AuthProvider>
-        <Routes>
-          {/* Public */}
-          <Route path="/login" element={<LoginPage />} />
-          <Route path="/signup" element={<SignUpPage />} />
-
-          {/* Protected — unauthenticated users are sent to /login */}
-          <Route element={<ProtectedRoute />}>
-            <Route path="/chat" element={<ChatLayout />}>
-              <Route index element={<ChatLanding />} />
-              <Route path=":threadId" element={<ThreadPage />} />
-            </Route>
-          </Route>
-
-          {/* Default */}
-          <Route path="*" element={<Navigate to="/chat" replace />} />
-        </Routes>
-      </AuthProvider>
+      <Routes>
+        <Route
+          path="/login"
+          element={
+            <PublicRoute>
+              <Login />
+            </PublicRoute>
+          }
+        />
+        <Route
+          path="/signup"
+          element={
+            <PublicRoute>
+              <SignUp />
+            </PublicRoute>
+          }
+        />
+        <Route path="/" element={<Navigate to="/chats" replace />} />
+        <Route
+          path="/chats"
+          element={
+            <ProtectedRoute>
+              <ChatLayout />
+            </ProtectedRoute>
+          }
+        >
+          <Route index element={<ChatEmptyPage />} />
+          <Route path=":threadId" element={<ChatThreadPage />} />
+        </Route>
+        <Route path="*" element={<Navigate to="/chats" replace />} />
+      </Routes>
     </BrowserRouter>
   )
 }
+
+export default App

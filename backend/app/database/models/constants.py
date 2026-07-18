@@ -1,3 +1,3 @@
-class MessageRole:
-    USER = "user"
-    ASSISTANT = "assistant"
+"""Shared constants for database models."""
+
+EMBEDDING_DIMENSIONS = 1536

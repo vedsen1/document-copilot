@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List
 
-from retrieval.retriever import search_hybrid
+from app.retrieval.retriever import search_hybrid
 
 
 async def retrieve_for_query(session: AsyncSession, query: str, k: int = 5):

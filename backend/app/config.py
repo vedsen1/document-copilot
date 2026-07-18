@@ -1,41 +1,63 @@
-from typing import Annotated
+from pathlib import Path
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic import computed_field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_BACKEND_DIR / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    # Supabase (Auth + API)
     supabase_url: str
     supabase_anon_key: str
     supabase_service_role_key: str
-
-    # Postgres (Alembic + direct DB access — use the direct/session connection, not the pooler)
     database_url: str
 
-    # OpenAI (LLM + embeddings)
     openai_api_key: str
     openai_embedding_model: str = "text-embedding-3-small"
-    openai_embedding_dimensions: int = Field(default=1536, ge=1)
+    openai_embedding_dimensions: int = 1536
+    openai_chat_model: str = "gpt-5.5"
+    openai_grounding_model: str = "gpt-4.1-mini"
+    openai_agent_request_limit: int = 20
+    openai_agent_temperature: float = 0.0
 
-    # Server
-    allowed_origins: Annotated[list[str], NoDecode]
+    retrieval_candidate_k: int = 50
+    retrieval_top_k: int = 10
+    retrieval_rrf_k: int = 60
+    retrieval_neighbor_radius: int = 1
+    retrieval_fts_config: str = "english"
+    retrieval_fts_keyword_model: str = "gpt-4.1-mini"
+    retrieval_fts_keyword_min: int = 3
+    retrieval_fts_keyword_max: int = 5
+    retrieval_fts_keyword_fast_path_tokens: int = 5
 
-    @field_validator("allowed_origins", mode="before")
-    @classmethod
-    def parse_allowed_origins(cls, value: str | list[str]) -> list[str]:
-        if isinstance(value, str):
-            origins = [origin.strip() for origin in value.split(",") if origin.strip()]
-            if not origins:
-                raise ValueError("ALLOWED_ORIGINS must include at least one origin")
-            return origins
-        return value
+    # Comma-separated in .env; use `cors_origins` for the parsed list.
+    allowed_origins: str = "http://localhost:5173"
+
+    @computed_field
+    @property
+    def sqlalchemy_database_url(self) -> str:
+        """Normalize Supabase-style URLs for SQLAlchemy + psycopg v3."""
+        url = self.database_url
+        if url.startswith("postgresql://"):
+            return url.replace("postgresql://", "postgresql+psycopg://", 1)
+        if url.startswith("postgres://"):
+            return url.replace("postgres://", "postgresql+psycopg://", 1)
+        return url
+
+    @computed_field
+    @property
+    def cors_origins(self) -> list[str]:
+        return [
+            origin.strip()
+            for origin in self.allowed_origins.split(",")
+            if origin.strip()
+        ]
 
 
 settings = Settings()

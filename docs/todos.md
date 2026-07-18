@@ -121,13 +121,13 @@ Goal: SEC filings in the corpus are parsed, chunked, embedded, and stored in Sup
 
 Goal: a user question returns ranked, relevant source passages.
 
-- [x] `retrieval/queries.py` — pgvector semantic search over `document_chunks`
-- [x] `retrieval/queries.py` — Postgres full-text search over `search_vector`
+- [x] `retrieval/pgvector_search.py` — pgvector semantic search over `document_chunks`
+- [x] `retrieval/fulltext_search.py` — Postgres full-text search over `search_vector`
 - [x] `retrieval/fusion.py` — Reciprocal Rank Fusion in Python
 - [x] `retrieval/retriever.py` — query → fused ranked passages + neighbor chunks
-- [x] Unit tests: fusion ranking, query assembly (mock DB)
-- [x] Integration test (optional, `@pytest.mark.integration`): real query against ingested corpus
-- [x] Verify: test queries from [client-brief](client-brief.md) return relevant chunks (manual or scripted)
+- [x] Unit tests: fusion ranking, query assembly (mock DB) — `tests/test_fusion.py`, `tests/test_pgvector_search.py`, `tests/test_fulltext_search.py` (23 tests, all passing)
+- [x] Integration test (optional, `@pytest.mark.integration`): real query against ingested corpus — `tests/test_retrieval_integration.py`
+- [x] Verify: test queries from [client-brief](client-brief.md) return relevant chunks — `tests/verify_retrieval.py` (runs all 10 questions, outputs `tests/verification_report.md`)
 
 ---
 

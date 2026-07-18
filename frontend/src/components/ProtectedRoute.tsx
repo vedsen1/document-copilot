@@ -1,25 +1,26 @@
-/**
- * Wraps any route that requires authentication.
- *
- * - While the initial session check is in flight: renders nothing (avoids
- *   a redirect flash before we know if the user is actually signed in).
- * - Unauthenticated: redirects to /login, preserving the intended URL so
- *   we can send the user back after they sign in.
- * - Authenticated: renders children as-is.
- */
+import type { ReactNode } from 'react'
+import { Navigate } from 'react-router-dom'
 
-import { Navigate, Outlet, useLocation } from 'react-router-dom'
-import { useAuth } from '@/context/AuthContext'
+import { useSession } from '@/hooks/useSession'
 
-export default function ProtectedRoute() {
-  const { session, loading } = useAuth()
-  const location = useLocation()
+type ProtectedRouteProps = {
+  children: ReactNode
+}
 
-  if (loading) return null
+export function ProtectedRoute({ children }: ProtectedRouteProps) {
+  const session = useSession()
 
-  if (!session) {
-    return <Navigate to="/login" state={{ from: location }} replace />
+  if (session === undefined) {
+    return (
+      <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">
+        Loading session…
+      </div>
+    )
   }
 
-  return <Outlet />
+  if (!session) {
+    return <Navigate to="/login" replace />
+  }
+
+  return children
 }

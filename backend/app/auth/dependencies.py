@@ -1,62 +1,69 @@
-"""FastAPI auth dependency — verify Supabase JWTs and expose the current user.
+"""FastAPI dependencies for Supabase JWT authentication."""
 
-Usage in a route::
+from __future__ import annotations
 
-    from app.auth.dependencies import CurrentUser
-
-    @router.get("/threads")
-    async def list_threads(user: CurrentUser) -> ...:
-        ...  # user.id is the authenticated Supabase user UUID
-
-The dependency extracts the bearer token from the ``Authorization`` header,
-calls Supabase Auth to validate it, and returns the user object.  Any
-missing, malformed, or expired token yields a 401 before the handler runs.
-"""
-
-from typing import Annotated
+import uuid
+from dataclasses import dataclass
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from supabase import AsyncClient
+from supabase import acreate_client
+from supabase.lib.client_options import AsyncClientOptions
+from supabase_auth.errors import AuthApiError
 
-from app.database.supabase import service_client
+from app.config import settings
 
-_bearer = HTTPBearer()
+_bearer = HTTPBearer(auto_error=False)
 
 
-async def _get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(_bearer)],
-):
-    """Validate the bearer JWT with Supabase Auth and return the User.
+@dataclass(frozen=True, slots=True)
+class CurrentUser:
+    id: uuid.UUID
+    email: str
 
-    ``HTTPBearer`` already rejects requests with no ``Authorization`` header
-    or a non-Bearer scheme with a 403, so by the time we get here the token
-    string is guaranteed to be present.
-    """
-    token = credentials.credentials
-    client: AsyncClient = await service_client()
+
+def _unauthorized(detail: str = "Not authenticated") -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def get_access_token(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> str:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise _unauthorized()
+
+    token = credentials.credentials.strip()
+    if not token:
+        raise _unauthorized()
+
+    return token
+
+
+async def get_current_user(
+    access_token: str = Depends(get_access_token),
+) -> CurrentUser:
+    client = await acreate_client(
+        settings.supabase_url,
+        settings.supabase_anon_key,
+        options=AsyncClientOptions(
+            auto_refresh_token=False,
+            persist_session=False,
+        ),
+    )
 
     try:
-        response = await client.auth.get_user(token)
-    except Exception as exc:
-        # Supabase raises for expired / invalid tokens; surface as 401.
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
+        response = await client.auth.get_user(jwt=access_token)
+    except AuthApiError as exc:
+        raise _unauthorized("Invalid or expired token") from exc
 
-    if response is None or response.user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    if response is None or response.user is None or not response.user.email:
+        raise _unauthorized("Invalid or expired token")
 
-    return response.user
-
-
-# Convenience alias — annotate route parameters with this type to inject the
-# validated user without repeating the Depends() boilerplate everywhere.
-# The concrete type is gotrue.types.User (inferred via supabase's stubs).
-CurrentUser = Annotated[object, Depends(_get_current_user)]
+    return CurrentUser(
+        id=uuid.UUID(str(response.user.id)),
+        email=response.user.email,
+    )
