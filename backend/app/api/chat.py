@@ -29,6 +29,7 @@ from app.auth.dependencies import CurrentUser
 from app.database import chats
 from app.database.models.chat_thread import ChatThread
 from app.database.session import get_session
+from app.chat.orchestrator import retrieve_for_query
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -146,9 +147,27 @@ async def stream_chat(body: StreamIn, user: CurrentUser, db: DB) -> StreamingRes
     if user_message:
         await chats.create_message(db, thread_id, "user", user_message.content)
 
+    # Run retrieval to show candidate citations (Phase 5).
+    query_text = user_message.content if user_message else ""
+    try:
+        citations = await retrieve_for_query(db, query_text, k=3) if query_text else []
+    except Exception:
+        citations = []
+
     # Collect the stub reply so we can persist it after streaming.
+    stub_intro = "This is a stubbed assistant reply. "
+    stub_retrieval = (
+        "I found some candidate source passages (showing first 3):\n"
+        + "\n".join(
+            [f"[{c['rank']}] {c['document_id']} / {c.get('section') or 'n/a'}" for c in citations]
+        )
+        + "\n"
+        if citations
+        else ""
+    )
     stub_parts = [
-        "This is a stubbed assistant reply. ",
+        stub_intro,
+        stub_retrieval,
         "Real retrieval and LLM generation will be wired in Phase 6. ",
         "The streaming pipeline is working end-to-end.",
     ]

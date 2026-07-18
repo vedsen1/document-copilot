@@ -34,5 +34,7 @@ dev = [
     "docling==2.111.0",
     "ipykernel==7.3.0",
     "pytest==9.1.1",
+    "pytest-asyncio = \"^0.22\"",
+    "anyio = \"^3.7\"",
     "ruff==0.15.20",
 ]
