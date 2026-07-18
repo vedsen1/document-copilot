@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from datetime import date
 
 from app.assistant.deps import TurnRegistry
 from app.assistant.outputs import Citation, GroundedAnswer
@@ -17,11 +18,17 @@ def _passage(text: str = "Services revenue grew 12% year over year.") -> Retriev
     return RetrievedPassage(
         chunk_id=chunk_id,
         document_id=uuid.uuid4(),
+        chunk_index=0,
         text=text,
+        page="10",
         section="Item 7",
-        score=0.8,
-        rank=1,
-        metadata={},
+        fusion_score=0.8,
+        ticker="AAPL",
+        company_name="Apple Inc.",
+        form="10-K",
+        filing_date=date(2024, 10, 31),
+        fiscal_year=2024,
+        accession_number="0000320193-24-000123",
     )
 
 

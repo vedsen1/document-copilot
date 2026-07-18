@@ -1,12 +1,12 @@
 # Backend
 
-FastAPI service for Document Copilot. Config lives in `app/config.py`; the app entrypoint is `app/main.py`.
+FastAPI service for Document Copilot. Python 3.12+, managed with [uv](https://docs.astral.sh/uv/).
 
 ## Setup
 
 ```bash
 cd backend
-cp .env.example .env   # fill in Supabase + OpenAI values
+cp .env.example .env   # fill in Supabase, Postgres, and OpenAI values
 uv sync
 ```
 
@@ -16,32 +16,23 @@ uv sync
 uv run uvicorn app.main:app --reload
 ```
 
-Health check: http://127.0.0.1:8000/health  
-API docs: http://127.0.0.1:8000/docs
+- API: [http://127.0.0.1:8000](http://127.0.0.1:8000)
+- Health: [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health)
+- Docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
-Or run directly:
+Alternative: `uv run python app/main.py`
 
-```bash
-uv run python app/main.py
-```
+## Day-to-day
 
-## Migrations
+| Task | Command |
+| --- | --- |
+| Install / update deps | `uv sync` |
+| Install ingestion deps | `uv sync --extra ingest` |
+| Add a dependency | `uv add <package>` |
+| Lint | `uv run ruff check .` |
+| Tests | `uv run pytest` |
+| DB migrations | `uv run alembic upgrade head` |
 
-```bash
-uv run alembic upgrade head
-```
+Env vars are read from `.env` via `app.config.settings` — do not call `os.getenv` in app code.
 
-Create a new migration after model changes:
-
-```bash
-uv run alembic revision --autogenerate -m "describe change"
-```
-
-## Tests & lint
-
-```bash
-uv run pytest
-uv run ruff check .
-```
-
-More detail (Alembic, imports, Jupyter): [docs/guides/backend-setup.md](../docs/guides/backend-setup.md)
+More detail (Alembic init, Jupyter kernel, ingestion): [docs/guides/backend-setup.md](../docs/guides/backend-setup.md).

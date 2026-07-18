@@ -1,246 +1,296 @@
-"""
-Chunk, embed, and store 10-K filings in Supabase.
+"""Chunk SEC HTML filings, embed chunks, and store them in document_chunks."""
 
-Reads data/markdown/manifest.json, converts each markdown file to a
-DoclingDocument, splits it with HybridChunker (text-embedding-3-small
-tokenizer, 512 tokens per chunk), generates embeddings via OpenAI, and
-writes document_chunks rows.  SourceDocument rows are upserted automatically.
-
-Usage (from repo root):
-    # Validate the whole pipeline cheaply — 1 chunk, 1 filing, ~1 API call:
-    uv run --project backend backend/ingest/chunk_and_embed.py --smoke-test
-
-    # Single ticker:
-    uv run --project backend backend/ingest/chunk_and_embed.py --tickers AAPL
-
-    # Full corpus, skipping already-ingested filings:
-    uv run --project backend backend/ingest/chunk_and_embed.py --skip-existing
-
-    # Combined:
-    uv run --project backend backend/ingest/chunk_and_embed.py --tickers MSFT NVDA --skip-existing
-"""
 from __future__ import annotations
 
 import argparse
-import asyncio
-import json
-import sys
-from pathlib import Path
+from dataclasses import dataclass
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-MARKDOWN_DIR = _REPO_ROOT / "data" / "markdown"
-MANIFEST_PATH = MARKDOWN_DIR / "manifest.json"
+from sqlalchemy import create_engine, delete, func, select
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database.models import DocumentChunk, DocumentTable, MessageCitation, SourceDocument
+from ingest.chunking import (
+    CHUNK_MAX_TOKENS,
+    ChunkRecord,
+    chunk_document,
+    html_path_for_accession,
+    iter_all_html_paths,
+)
+from ingest.embeddings import EMBED_BATCH_SIZE, embed_texts
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+@dataclass(frozen=True, slots=True)
+class IngestCounts:
+    processed: int = 0
+    skipped: int = 0
+    chunks_written: int = 0
+
+
+def _filing_metadata(document: SourceDocument) -> dict:
+    return {
+        "ticker": document.ticker,
+        "cik": document.cik,
+        "company_name": document.company_name,
+        "form": document.form,
+        "filing_date": document.filing_date.isoformat(),
+        "report_date": document.report_date.isoformat() if document.report_date else None,
+        "fiscal_year": document.fiscal_year,
+        "accession_number": document.accession_number,
+        "primary_document": document.primary_document,
+        "source_url": document.source_url,
+    }
+
+
+def _document_has_chunks(session: Session, document_id) -> bool:
+    count = session.scalar(
+        select(func.count())
+        .select_from(DocumentChunk)
+        .where(DocumentChunk.document_id == document_id)
     )
-    p.add_argument(
-        "--smoke-test",
-        action="store_true",
-        help=(
-            "Embed only the first chunk of the first selected filing and write "
-            "it to Supabase, then exit.  Use this to validate the pipeline "
-            "end-to-end before spending credits on a full corpus run."
-        ),
+    return bool(count)
+
+
+def _delete_chunks(session: Session, document_id) -> None:
+    chunk_ids = select(DocumentChunk.id).where(DocumentChunk.document_id == document_id)
+    session.execute(
+        delete(MessageCitation).where(MessageCitation.chunk_id.in_(chunk_ids))
     )
-    p.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip filings that already have chunks in document_chunks.",
+    session.execute(
+        delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
     )
-    p.add_argument(
-        "--tickers",
-        nargs="+",
-        metavar="TICKER",
-        help="Restrict to these tickers (e.g. AAPL MSFT).",
+    session.execute(
+        delete(DocumentTable).where(DocumentTable.document_id == document_id)
     )
-    return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# DB helpers
-# ---------------------------------------------------------------------------
-
-
-async def _get_chunked_accessions(session) -> set[str]:
-    """Return accession_numbers that already have at least one document_chunk."""
-    from sqlalchemy import text
-
-    result = await session.execute(
-        text(
-            "SELECT DISTINCT sd.accession_number "
-            "FROM source_documents sd "
-            "JOIN document_chunks dc ON dc.document_id = sd.id"
+def _document_tables_from_records(
+    document_id,
+    records: list[ChunkRecord],
+) -> list[DocumentTable]:
+    tables_by_index: dict[int, DocumentTable] = {}
+    for record in records:
+        metadata = record.chunk_metadata
+        if metadata.get("chunk_kind") != "table_row":
+            continue
+        table_data = metadata.get("table")
+        table_index = metadata.get("table_index")
+        if not isinstance(table_data, dict) or not isinstance(table_index, int):
+            continue
+        if table_index in tables_by_index:
+            continue
+        tables_by_index[table_index] = DocumentTable(
+            document_id=document_id,
+            table_index=table_index,
+            title=table_data.get("title"),
+            units=table_data.get("units"),
+            markdown=table_data["markdown"],
+            table_data=table_data,
+            source_html_hash=table_data["source_html_hash"],
         )
+    return list(tables_by_index.values())
+
+
+def ingest_document(
+    session: Session,
+    document: SourceDocument,
+    *,
+    max_chunks: int | None = None,
+    dry_run: bool = False,
+    skip_existing: bool = True,
+    force: bool = False,
+) -> int:
+    if force and not dry_run:
+        _delete_chunks(session, document.id)
+    elif skip_existing and _document_has_chunks(session, document.id):
+        print(f"Skipping existing chunks for {document.accession_number}")
+        return 0
+
+    html_path = html_path_for_accession(document.accession_number)
+    print(f"Chunking {document.accession_number} from {html_path.name}...")
+    records = chunk_document(
+        html_path,
+        _filing_metadata(document),
+        max_chunks=max_chunks,
     )
-    return {row[0] for row in result.fetchall()}
 
+    if not records:
+        print(f"No chunks produced for {document.accession_number}")
+        return 0
 
-async def _insert_chunks(
-    session,
-    doc_id,
-    chunks: list[dict],
-    embeddings: list[list[float]],
-) -> None:
-    from app.database.models.document_chunk import DocumentChunk
+    max_tokens = max(record.token_count for record in records)
+    print(
+        f"  {len(records)} chunk(s), max_tokens={max_tokens}, "
+        f"limit={CHUNK_MAX_TOKENS}"
+    )
 
-    for chunk, vector in zip(chunks, embeddings):
+    if dry_run:
+        sample = records[0]
+        print(f"  sample section={sample.section!r} page={sample.page!r}")
+        print(f"  sample preview={sample.text[:120]!r}")
+        return len(records)
+
+    texts = [record.text for record in records]
+    print(f"  Embedding {len(texts)} chunk(s) (batch_size={EMBED_BATCH_SIZE})...")
+    vectors = embed_texts(texts)
+    document_tables = _document_tables_from_records(document.id, records)
+    for table in document_tables:
+        session.add(table)
+    if document_tables:
+        session.flush()
+    table_ids_by_index = {table.table_index: str(table.id) for table in document_tables}
+
+    for record, embedding in zip(records, vectors, strict=True):
+        metadata = dict(record.chunk_metadata)
+        table_index = metadata.get("table_index")
+        if isinstance(table_index, int) and table_index in table_ids_by_index:
+            metadata["table_id"] = table_ids_by_index[table_index]
         session.add(
             DocumentChunk(
-                document_id=doc_id,
-                chunk_index=chunk["chunk_index"],
-                text=chunk["text"],
-                section=chunk.get("section"),
-                # Approximate; exact count would require passing the tokenizer here
-                token_count=len(chunk["text"]) // 4,
-                embedding=vector,
-                chunk_metadata=chunk.get("chunk_metadata", {}),
+                document_id=document.id,
+                chunk_index=record.chunk_index,
+                page=record.page,
+                section=record.section,
+                text=record.text,
+                embedding=embedding,
+                token_count=record.token_count,
+                chunk_metadata=metadata,
             )
         )
 
+    session.commit()
+    print(f"  Wrote {len(records)} chunk(s) for {document.accession_number}")
+    return len(records)
 
-# ---------------------------------------------------------------------------
-# Main pipeline
-# ---------------------------------------------------------------------------
 
+def ingest_accessions(
+    accessions: list[str],
+    *,
+    max_chunks: int | None = None,
+    dry_run: bool = False,
+    skip_existing: bool = True,
+    force: bool = False,
+) -> IngestCounts:
+    engine = create_engine(settings.sqlalchemy_database_url)
+    counts = IngestCounts()
 
-async def run(args: argparse.Namespace) -> None:
-    try:
-        import sqlalchemy  # noqa: F401
-    except ImportError:
-        sys.exit(
-            "Required packages not importable.\n"
-            "Run via:  uv run --project backend backend/ingest/chunk_and_embed.py"
-        )
-
-    from openai import AsyncOpenAI
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-    from app.config import settings
-    from app.database.models import __all__ as _  # ensures models are registered  # noqa: F401
-    from ingest.chunking import build_chunker, build_converter, chunk_document
-    from ingest.embeddings import embed_all
-    from ingest.load_source_documents import upsert_source_document
-
-    if not MANIFEST_PATH.exists():
-        sys.exit(
-            f"Manifest not found: {MANIFEST_PATH}\n"
-            "Run data/convert_to_markdown.py first."
-        )
-
-    with MANIFEST_PATH.open(encoding="utf-8") as f:
-        manifest = json.load(f)
-
-    filings = manifest["filings"]
-    if args.tickers:
-        tickers_upper = {t.upper() for t in args.tickers}
-        filings = [f for f in filings if f["ticker"] in tickers_upper]
-        if not filings:
-            sys.exit(f"No filings found for tickers: {args.tickers}")
-
-    if args.smoke_test:
-        # Pick just the first filing; we will also truncate to 1 chunk below
-        filings = filings[:1]
-
-    db_url = (
-        settings.database_url
-        .replace("postgresql://", "postgresql+psycopg://", 1)
-        .replace("postgres://", "postgresql+psycopg://", 1)
-    )
-    engine = create_async_engine(db_url, pool_pre_ping=True)
-    SessionFactory = async_sessionmaker(engine, expire_on_commit=False)
-    openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
-    embedding_model = settings.openai_embedding_model
-
-    # Fetch already-chunked accessions once upfront
-    async with SessionFactory() as session:
-        async with session.begin():
-            already_chunked = await _get_chunked_accessions(session)
-
-    print("Initialising docling chunker and converter...")
-    chunker = build_chunker()
-    converter = build_converter()
-    print("Ready.\n")
-
-    total = len(filings)
-    ingested = skipped = failed = 0
-
-    for i, filing in enumerate(filings, 1):
-        accession = filing["accession_number"]
-        label = f"[{i}/{total}] {filing['ticker']} {filing['filing_date']}"
-
-        if args.skip_existing and accession in already_chunked:
-            print(f"{label}  [SKIP] already chunked")
-            skipped += 1
-            continue
-
-        md_path = MARKDOWN_DIR / Path(filing["markdown_path"])
-        if not md_path.exists():
-            print(f"{label}  [ERROR] markdown file missing: {md_path}")
-            failed += 1
-            continue
-
-        markdown = md_path.read_text(encoding="utf-8")
-
-        # Chunk in a thread — convert_string is synchronous CPU work
-        chunks = await asyncio.to_thread(chunk_document, markdown, chunker, converter)
-
-        if not chunks:
-            print(f"{label}  [WARN] no chunks produced, skipping")
-            failed += 1
-            continue
-
-        if args.smoke_test:
-            chunks = chunks[:1]  # only 1 API call
-
-        print(f"{label}  {len(chunks)} chunk(s)  ", end="", flush=True)
-
-        try:
-            # embed_text carries the context-enriched version (heading path + body)
-            embed_texts = [c["embed_text"] for c in chunks]
-            embeddings = await embed_all(openai_client, embed_texts, embedding_model)
-
-            async with SessionFactory() as session:
-                async with session.begin():
-                    # upsert_source_document deletes + re-inserts, cascading to
-                    # any existing chunks for this filing via the FK cascade
-                    doc_id = await upsert_source_document(session, filing, markdown)
-                    await _insert_chunks(session, doc_id, chunks, embeddings)
-
-            ingested += 1
-            print("[OK]")
-
-            if args.smoke_test:
-                print(
-                    f"\n✓ Smoke test passed.\n"
-                    f"  doc_id      = {doc_id}\n"
-                    f"  chunk_index = 0\n"
-                    f"  section     = {chunks[0].get('section')!r}\n"
-                    f"  headings    = {chunks[0]['chunk_metadata']['headings']}\n"
-                    f"\n"
-                    f"Check Supabase: document_chunks should have 1 row with a "
-                    f"non-null embedding ({len(embeddings[0])} floats)."
+    with Session(engine) as session:
+        for accession in accessions:
+            document = session.scalar(
+                select(SourceDocument).where(
+                    SourceDocument.accession_number == accession
+                )
+            )
+            if document is None:
+                raise ValueError(
+                    f"No source_document for accession {accession}. "
+                    "Run `uv run python -m ingest.load_source_documents` first."
                 )
 
-        except Exception as exc:
-            failed += 1
-            print(f"[ERROR] {exc}")
+            if (
+                not dry_run
+                and not force
+                and skip_existing
+                and _document_has_chunks(session, document.id)
+            ):
+                print(f"Skipping existing chunks for {accession}")
+                counts = IngestCounts(
+                    processed=counts.processed,
+                    skipped=counts.skipped + 1,
+                    chunks_written=counts.chunks_written,
+                )
+                continue
 
-    await engine.dispose()
+            written = ingest_document(
+                session,
+                document,
+                max_chunks=max_chunks,
+                dry_run=dry_run,
+                skip_existing=skip_existing,
+                force=force,
+            )
+            counts = IngestCounts(
+                processed=counts.processed + 1,
+                skipped=counts.skipped,
+                chunks_written=counts.chunks_written + written,
+            )
 
-    if not args.smoke_test:
-        print(f"\nDone.  ingested={ingested}  skipped={skipped}  failed={failed}")
+    return counts
+
+
+def ingest_all(
+    *,
+    max_chunks: int | None = None,
+    dry_run: bool = False,
+    skip_existing: bool = True,
+    force: bool = False,
+) -> IngestCounts:
+    accessions = [accession for accession, _ in iter_all_html_paths()]
+    return ingest_accessions(
+        accessions,
+        max_chunks=max_chunks,
+        dry_run=dry_run,
+        skip_existing=skip_existing,
+        force=force,
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--accession", help="Process one filing by accession number")
+    target.add_argument("--all", action="store_true", help="Process all manifest filings")
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=None,
+        help="Cap chunks per document (use 1 for smoke test)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Chunk only; no embeddings or database writes",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip documents that already have chunks (default: true)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Delete existing chunks for target document(s) before re-ingesting",
+    )
+    return parser
 
 
 def main() -> None:
-    args = parse_args()
-    # psycopg async is incompatible with Windows ProactorEventLoop
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(run(args))
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.all:
+        result = ingest_all(
+            max_chunks=args.max_chunks,
+            dry_run=args.dry_run,
+            skip_existing=args.skip_existing,
+            force=args.force,
+        )
+    else:
+        result = ingest_accessions(
+            [args.accession],
+            max_chunks=args.max_chunks,
+            dry_run=args.dry_run,
+            skip_existing=args.skip_existing,
+            force=args.force,
+        )
+
+    print(
+        "Done: "
+        f"{result.processed} document(s) processed, "
+        f"{result.skipped} skipped, "
+        f"{result.chunks_written} chunk(s) written"
+    )
 
 
 if __name__ == "__main__":

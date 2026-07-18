@@ -1,6 +1,7 @@
 from app.database.base import Base
 from app.database.models.chat_message import ChatMessage
 from app.database.models.chat_thread import ChatThread
+from app.database.models.constants import EMBEDDING_DIMENSIONS
 from app.database.models.document_chunk import DocumentChunk
 from app.database.models.document_table import DocumentTable
 from app.database.models.message_citation import MessageCitation
@@ -10,12 +11,13 @@ from app.database.models.user import User
 
 __all__ = [
     "Base",
-    "User",
-    "SourceDocument",
+    "ChatMessage",
+    "ChatThread",
     "DocumentChunk",
     "DocumentTable",
-    "ChatThread",
-    "ChatMessage",
+    "EMBEDDING_DIMENSIONS",
     "MessageCitation",
     "MessageRole",
+    "SourceDocument",
+    "User",
 ]

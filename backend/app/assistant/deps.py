@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 from uuid import UUID
 
+from app.retrieval.retriever import DocumentRetriever
 from app.retrieval.types import RetrievedPassage
-
-if TYPE_CHECKING:
-    from app.retrieval.retriever import DocumentRetriever
 
 StatusCallback = Callable[[str, str], None]
 
@@ -23,10 +20,8 @@ class TurnRegistry:
 
     def register(self, passage: RetrievedPassage) -> None:
         self.passages_by_chunk_id[passage.chunk_id] = passage
-        # Handle both old and new RetrievedPassage models
-        if hasattr(passage, 'neighbors'):
-            for neighbor in passage.neighbors:
-                self.passages_by_chunk_id[neighbor.chunk_id] = neighbor
+        for neighbor in passage.neighbors:
+            self.passages_by_chunk_id[neighbor.chunk_id] = neighbor
 
     def register_many(self, passages: list[RetrievedPassage]) -> None:
         for passage in passages:
@@ -35,7 +30,7 @@ class TurnRegistry:
 
 @dataclass
 class DocumentAgentDeps:
-    retriever: "DocumentRetriever"
+    retriever: DocumentRetriever
     registry: TurnRegistry
     thread_id: UUID
     user_id: UUID

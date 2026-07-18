@@ -1,186 +1,192 @@
-"""Chat API — thread CRUD and streaming chat endpoint.
+"""FastAPI routes for chat threads and stubbed streaming."""
 
-Routes
-------
-GET  /chat/threads                        list the authenticated user's threads
-POST /chat/threads                        create a new thread
-GET  /chat/threads/{thread_id}/messages   load message history for a thread
-POST /chat/stream                         streaming chat turn (stubbed)
+from __future__ import annotations
 
-Authorization
--------------
-Every route that touches a specific thread calls ``_require_thread`` which
-returns 404 if the thread doesn't exist and 403 if it belongs to a different
-user.  This keeps the ownership check in one place.
-"""
-
-import asyncio
 import uuid
-from collections.abc import AsyncGenerator
-from datetime import datetime
-from typing import Annotated
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import CurrentUser
-from app.database import chats
-from app.database.models.chat_thread import ChatThread
+from app.auth.dependencies import CurrentUser, get_access_token, get_current_user
+from app.chat.messages import extract_last_user_message
+from app.chat.orchestrator import run_turn
+from app.database.chats import (
+    create_thread,
+    delete_thread,
+    list_threads,
+    load_messages,
+    require_thread_access,
+)
+from app.database.documents import get_chunk_context
+from app.database.models import DocumentChunk
 from app.database.session import get_session
-from app.chat.orchestrator import retrieve_for_query
+from app.database.supabase import create_user_client
+from app.database.users import ensure_user
+from app.retrieval.retriever import DocumentRetriever
+from app.schemas.chat import (
+    CitationContextChunk,
+    CitationContextResponse,
+    CitationContextTable,
+    CreateThreadRequest,
+    MessageHistoryResponse,
+    StreamRequest,
+    ThreadListResponse,
+    ThreadResponse,
+)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
-# Convenience type alias for the injected session
-DB = Annotated[AsyncSession, Depends(get_session)]
+
+def _chunk_role(
+    chunk: DocumentChunk,
+    anchor: DocumentChunk,
+) -> Literal["previous", "anchor", "next"]:
+    if chunk.id == anchor.id:
+        return "anchor"
+    if chunk.chunk_index < anchor.chunk_index:
+        return "previous"
+    return "next"
 
 
-# ---------------------------------------------------------------------------
-# Response schemas
-# ---------------------------------------------------------------------------
+def citation_context_response(
+    chunks: list[DocumentChunk],
+    *,
+    anchor_chunk_id: uuid.UUID,
+) -> CitationContextResponse:
+    anchor = next(chunk for chunk in chunks if chunk.id == anchor_chunk_id)
+    document = anchor.document
+    return CitationContextResponse(
+        anchor_chunk_id=anchor.id,
+        document_id=anchor.document_id,
+        ticker=document.ticker,
+        company_name=document.company_name,
+        form=document.form,
+        filing_date=document.filing_date,
+        source_url=document.source_url,
+        table=_table_context_from_chunk(anchor),
+        chunks=[
+            CitationContextChunk(
+                chunk_id=chunk.id,
+                chunk_index=chunk.chunk_index,
+                role=_chunk_role(chunk, anchor),
+                text=chunk.text,
+                page=chunk.page,
+                section=chunk.section,
+            )
+            for chunk in chunks
+        ],
+    )
 
 
-class ThreadOut(BaseModel):
-    id: uuid.UUID
-    title: str
-    created_at: datetime
-    updated_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-class MessageOut(BaseModel):
-    id: uuid.UUID
-    thread_id: uuid.UUID
-    role: str
-    content: str
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
+def _table_context_from_chunk(chunk: DocumentChunk) -> CitationContextTable | None:
+    metadata = chunk.chunk_metadata or {}
+    if metadata.get("chunk_kind") != "table_row":
+        return None
+    table_data = metadata.get("table")
+    if not isinstance(table_data, dict):
+        return None
+    return CitationContextTable(
+        table_index=table_data["table_index"],
+        title=table_data.get("title"),
+        units=table_data.get("units"),
+        markdown=table_data["markdown"],
+        table_data=table_data,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Request schemas
-# ---------------------------------------------------------------------------
+def load_citation_context(
+    chunk_id: uuid.UUID,
+    radius: int,
+) -> CitationContextResponse | None:
+    with get_session() as session:
+        chunks = get_chunk_context(session, chunk_id, radius)
+        if chunks is None:
+            return None
+        return citation_context_response(chunks, anchor_chunk_id=chunk_id)
 
 
-class CreateThreadIn(BaseModel):
-    title: str = "New chat"
+@router.get("/threads")
+async def get_threads(
+    user: CurrentUser = Depends(get_current_user),
+    access_token: str = Depends(get_access_token),
+) -> ThreadListResponse:
+    await ensure_user(user)
+    client = await create_user_client(access_token)
+    threads = await list_threads(client, user)
+    return ThreadListResponse(threads=threads)
 
 
-class AiSdkMessage(BaseModel):
-    role: str
-    content: str
+@router.post("/threads")
+async def post_thread(
+    body: CreateThreadRequest,
+    user: CurrentUser = Depends(get_current_user),
+    access_token: str = Depends(get_access_token),
+) -> ThreadResponse:
+    await ensure_user(user)
+    client = await create_user_client(access_token)
+    return await create_thread(client, user, title=body.title)
 
 
-class StreamIn(BaseModel):
-    thread_id: uuid.UUID
-    messages: list[AiSdkMessage]
+@router.get("/threads/{thread_id}/messages")
+async def get_thread_messages(
+    thread_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    access_token: str = Depends(get_access_token),
+) -> MessageHistoryResponse:
+    await require_thread_access(thread_id, user)
+    client = await create_user_client(access_token)
+    messages = await load_messages(client, thread_id)
+    return MessageHistoryResponse(messages=messages)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-async def _require_thread(
-    session: AsyncSession,
-    thread_id: str,
-    user_id: str,
-) -> ChatThread:
-    """Return the thread or raise 404/403."""
-    thread = await chats.get_thread(session, thread_id)
-    if thread is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found")
-    if str(thread.user_id) != user_id:
+@router.get("/citations/{chunk_id}/context")
+async def get_citation_context(
+    chunk_id: uuid.UUID,
+    radius: int = Query(default=1, ge=0, le=3),
+    _user: CurrentUser = Depends(get_current_user),
+) -> CitationContextResponse:
+    context = await run_in_threadpool(load_citation_context, chunk_id, radius)
+    if context is None:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Thread not found or access denied",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Citation chunk not found",
         )
-    return thread
+    return context
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-
-@router.get("/threads", response_model=list[ThreadOut])
-async def list_threads(user: CurrentUser, db: DB) -> list[ThreadOut]:
-    await chats.upsert_user(db, user.id, user.email or "")  # type: ignore[union-attr]
-    threads = await chats.list_threads(db, user.id)  # type: ignore[union-attr]
-    return [ThreadOut.model_validate(t) for t in threads]
-
-
-@router.post("/threads", response_model=ThreadOut, status_code=status.HTTP_201_CREATED)
-async def create_thread(body: CreateThreadIn, user: CurrentUser, db: DB) -> ThreadOut:
-    await chats.upsert_user(db, user.id, user.email or "")  # type: ignore[union-attr]
-    thread = await chats.create_thread(db, user.id, body.title)  # type: ignore[union-attr]
-    return ThreadOut.model_validate(thread)
-
-
-@router.get("/threads/{thread_id}/messages", response_model=list[MessageOut])
-async def list_messages(
-    thread_id: str, user: CurrentUser, db: DB
-) -> list[MessageOut]:
-    await _require_thread(db, thread_id, user.id)  # type: ignore[union-attr]
-    messages = await chats.list_messages(db, thread_id)
-    return [MessageOut.model_validate(m) for m in messages]
+@router.delete("/threads/{thread_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_thread_route(
+    thread_id: uuid.UUID,
+    user: CurrentUser = Depends(get_current_user),
+    access_token: str = Depends(get_access_token),
+) -> None:
+    await require_thread_access(thread_id, user)
+    client = await create_user_client(access_token)
+    await delete_thread(client, thread_id)
 
 
 @router.post("/stream")
-async def stream_chat(body: StreamIn, user: CurrentUser, db: DB) -> StreamingResponse:
-    thread_id = str(body.thread_id)
-    user_id: str = user.id  # type: ignore[union-attr]
-    user_email: str = user.email or ""  # type: ignore[union-attr]
+async def post_stream(
+    body: StreamRequest,
+    user: CurrentUser = Depends(get_current_user),
+    access_token: str = Depends(get_access_token),
+) -> StreamingResponse:
+    await ensure_user(user)
+    thread = await require_thread_access(body.thread_id, user)
+    user_message = extract_last_user_message(body.messages)
+    client = await create_user_client(access_token)
 
-    await chats.upsert_user(db, user_id, user_email)
-    await _require_thread(db, thread_id, user_id)
-
-    # Persist the incoming user message (last message in the list).
-    # The history is already in the DB; only the new turn needs saving.
-    user_message = next(
-        (m for m in reversed(body.messages) if m.role == "user"), None
+    retriever = DocumentRetriever()
+    return StreamingResponse(
+        run_turn(
+            client=client,
+            thread_id=body.thread_id,
+            user=user,
+            user_message=user_message,
+            thread_title=thread.title,
+            retriever=retriever,
+        ),
+        media_type="text/event-stream",
     )
-    if user_message:
-        await chats.create_message(db, thread_id, "user", user_message.content)
-
-    # Run retrieval to show candidate citations (Phase 5).
-    query_text = user_message.content if user_message else ""
-    try:
-        citations = await retrieve_for_query(db, query_text, k=3) if query_text else []
-    except Exception:
-        citations = []
-
-    # Collect the stub reply so we can persist it after streaming.
-    stub_intro = "This is a stubbed assistant reply. "
-    stub_retrieval = (
-        "I found some candidate source passages (showing first 3):\n"
-        + "\n".join(
-            [f"[{c['rank']}] {c['document_id']} / {c.get('section') or 'n/a'}" for c in citations]
-        )
-        + "\n"
-        if citations
-        else ""
-    )
-    stub_parts = [
-        stub_intro,
-        stub_retrieval,
-        "Real retrieval and LLM generation will be wired in Phase 6. ",
-        "The streaming pipeline is working end-to-end.",
-    ]
-    full_reply = "".join(stub_parts)
-
-    # Persist the assistant message now — before streaming starts — so it's
-    # always saved even if the client disconnects mid-stream.
-    await chats.create_message(db, thread_id, "assistant", full_reply)
-
-    async def event_stream() -> AsyncGenerator[str, None]:
-        for part in stub_parts:
-            yield f"data: {part}\n\n"
-            await asyncio.sleep(0.05)
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")

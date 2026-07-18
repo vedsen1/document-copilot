@@ -1,37 +1,39 @@
-"""
-OpenAI embedding helpers.
+"""OpenAI embedding generation for document chunks."""
 
-All public functions are async and accept an AsyncOpenAI client. Batching is
-handled automatically to stay within the API's per-request item limit.
-
-Usage:
-    from ingest.embeddings import embed_all
-
-    vectors = await embed_all(openai_client, texts, model)
-"""
 from __future__ import annotations
 
+from openai import OpenAI
 
-async def embed_batch(client, texts: list[str], model: str) -> list[list[float]]:
-    """Embed one batch of texts; preserves input ordering via response index."""
-    response = await client.embeddings.create(input=texts, model=model)
-    return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
+from app.config import settings
+
+EMBED_BATCH_SIZE = 100
 
 
-async def embed_all(
-    client,
-    texts: list[str],
-    model: str,
-    batch_size: int = 100,
-) -> list[list[float]]:
-    """
-    Embed arbitrarily many texts by splitting into API-safe batches.
+def _client() -> OpenAI:
+    return OpenAI(api_key=settings.openai_api_key)
 
-    OpenAI's embedding endpoint accepts up to 2 048 inputs per request;
-    batch_size=100 is conservative and well within all tier limits.
-    """
-    results: list[list[float]] = []
-    for i in range(0, len(texts), batch_size):
-        vectors = await embed_batch(client, texts[i : i + batch_size], model)
-        results.extend(vectors)
-    return results
+
+def embed_texts(texts: list[str], *, batch_size: int = EMBED_BATCH_SIZE) -> list[list[float]]:
+    if not texts:
+        return []
+
+    expected_dims = settings.openai_embedding_dimensions
+    vectors: list[list[float]] = []
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        response = _client().embeddings.create(
+            input=batch,
+            model=settings.openai_embedding_model,
+            dimensions=expected_dims,
+        )
+        ordered = sorted(response.data, key=lambda item: item.index)
+        for item in ordered:
+            embedding = item.embedding
+            if len(embedding) != expected_dims:
+                raise ValueError(
+                    f"Expected embedding dimension {expected_dims}, got {len(embedding)}"
+                )
+            vectors.append(embedding)
+
+    return vectors

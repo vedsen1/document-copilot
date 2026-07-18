@@ -1,51 +1,146 @@
-/**
- * Thin fetch wrapper that automatically attaches the Supabase bearer token.
- *
- * All API calls to the FastAPI backend should go through `apiFetch` so that:
- *   - The `Authorization: Bearer <token>` header is always present.
- *   - The base URL is taken from the validated `env` module.
- *   - Non-2xx responses are thrown as `Error` with the server message.
- *
- * For streaming endpoints use `apiFetch` directly and read `response.body`.
- */
-
 import { env } from '@/lib/env'
-import { supabase } from '@/lib/supabase'
 
-async function getToken(): Promise<string> {
-  const { data, error } = await supabase.auth.getSession()
-  if (error || !data.session) {
-    throw new Error('Not authenticated')
-  }
-  return data.session.access_token
+const DEFAULT_TIMEOUT_MS = 30_000
+
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
+
+export type RequestOptions = {
+  method?: HttpMethod
+  body?: unknown
+  headers?: Record<string, string>
+  accessToken?: string | null
+  timeoutMs?: number
 }
 
-export async function apiFetch(
-  path: string,
-  init: RequestInit = {},
-): Promise<Response> {
-  const token = await getToken()
+export class ApiError extends Error {
+  readonly status: number
+  readonly detail: unknown
+  readonly isNetworkError: boolean
 
-  const response = await fetch(`${env.apiBaseUrl}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...init.headers,
-      Authorization: `Bearer ${token}`,
+  constructor(
+    message: string,
+    options: {
+      status: number
+      detail?: unknown
+      isNetworkError?: boolean
     },
-  })
+  ) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = options.status
+    this.detail = options.detail
+    this.isNetworkError = options.isNetworkError ?? false
+  }
+}
 
-  if (!response.ok) {
-    // Attempt to surface the server error message; fall back to status text.
-    let message: string
+function buildUrl(path: string): string {
+  return path.startsWith('/') ? `${env.apiBaseUrl}${path}` : `${env.apiBaseUrl}/${path}`
+}
+
+async function parseErrorBody(response: Response): Promise<unknown> {
+  const contentType = response.headers.get('content-type') ?? ''
+  if (contentType.includes('application/json')) {
     try {
-      const body = await response.json()
-      message = body?.detail ?? response.statusText
+      return await response.json()
     } catch {
-      message = response.statusText
+      return null
     }
-    throw new Error(`API error ${response.status}: ${message}`)
   }
 
-  return response
+  try {
+    const text = await response.text()
+    return text.length > 0 ? text : null
+  } catch {
+    return null
+  }
+}
+
+function errorMessage(detail: unknown, fallback: string): string {
+  if (typeof detail === 'string' && detail.trim() !== '') {
+    return detail
+  }
+
+  if (
+    detail !== null &&
+    typeof detail === 'object' &&
+    'detail' in detail &&
+    typeof detail.detail === 'string'
+  ) {
+    return detail.detail
+  }
+
+  return fallback
+}
+
+export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const {
+    method = 'GET',
+    body,
+    headers = {},
+    accessToken,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+  } = options
+
+  const requestHeaders = new Headers(headers)
+
+  if (accessToken) {
+    requestHeaders.set('Authorization', `Bearer ${accessToken}`)
+  }
+
+  if (body !== undefined && !requestHeaders.has('Content-Type')) {
+    requestHeaders.set('Content-Type', 'application/json')
+  }
+
+  const controller = new AbortController()
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const response = await fetch(buildUrl(path), {
+      method,
+      headers: requestHeaders,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller.signal,
+    })
+
+    if (!response.ok) {
+      const detail = await parseErrorBody(response)
+      throw new ApiError(errorMessage(detail, response.statusText), {
+        status: response.status,
+        detail,
+      })
+    }
+
+    if (response.status === 204) {
+      return undefined as T
+    }
+
+    const contentType = response.headers.get('content-type') ?? ''
+    if (!contentType.includes('application/json')) {
+      return undefined as T
+    }
+
+    return (await response.json()) as T
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error
+    }
+
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new ApiError('Request timed out', {
+        status: 0,
+        isNetworkError: true,
+      })
+    }
+
+    if (error instanceof TypeError) {
+      throw new ApiError('Network error', {
+        status: 0,
+        isNetworkError: true,
+      })
+    }
+
+    throw error
+  } finally {
+    window.clearTimeout(timeoutId)
+  }
 }

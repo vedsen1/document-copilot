@@ -1,53 +1,50 @@
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
 
 from alembic import context
 
-# Load our settings so the real DATABASE_URL is used, not the ini placeholder.
 from app.config import settings
-
-# Import all models so autogenerate can see them.
-import app.database.models  # noqa: F401
-from app.database.base import Base
+from app.database.models import Base  # noqa: F401 — register models on metadata
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Normalize the driver to psycopg (v3). The .env uses the bare `postgresql://`
-# scheme which SQLAlchemy routes to psycopg2; we only have psycopg v3 installed.
-db_url = settings.database_url.replace(
-    "postgresql://", "postgresql+psycopg://", 1
-).replace(
-    "postgres://", "postgresql+psycopg://", 1
-)
-config.set_main_option("sqlalchemy.url", db_url)
-
 target_metadata = Base.metadata
 
 
+def get_database_url() -> str:
+    return settings.sqlalchemy_database_url
+
+
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
     context.configure(
-        url=url,
+        url=get_database_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        compare_type=True,
     )
+
     with context.begin_transaction():
         context.run_migrations()
 
 
 def run_migrations_online() -> None:
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+    connectable = create_engine(
+        get_database_url(),
         poolclass=pool.NullPool,
     )
+
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=True,
+        )
+
         with context.begin_transaction():
             context.run_migrations()
 

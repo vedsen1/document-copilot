@@ -1,6 +1,7 @@
-from enum import Enum
+import enum
 
 
-class MessageRole(str, Enum):
+class MessageRole(str, enum.Enum):
     USER = "user"
     ASSISTANT = "assistant"
+    SYSTEM = "system"
