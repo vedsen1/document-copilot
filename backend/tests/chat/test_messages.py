@@ -16,7 +16,7 @@ from app.chat.messages import (
     ui_message_to_insert,
 )
 from app.retrieval.types import RetrievedPassage
-from app.schemas.chat import CitationPart, TextPart, UIMessage
+from app.schemas.chat import CitationPart, StreamRequest, TextPart, UIMessage
 
 
 def test_text_from_parts_joins_text_segments() -> None:
@@ -44,6 +44,18 @@ def test_extract_last_user_message_raises_when_missing() -> None:
     with pytest.raises(HTTPException) as exc_info:
         extract_last_user_message(messages)
     assert exc_info.value.status_code == 422
+
+
+def test_stream_request_accepts_content_based_messages() -> None:
+    request = StreamRequest.model_validate(
+        {
+            "threadId": str(uuid.uuid4()),
+            "messages": [{"role": "user", "content": "Hello from the frontend"}],
+        }
+    )
+
+    assert request.messages[0].role == "user"
+    assert request.messages[0].parts[0].text == "Hello from the frontend"
 
 
 def test_ui_message_to_insert_maps_fields() -> None:

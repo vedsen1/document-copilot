@@ -6,7 +6,7 @@ import uuid
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TextPart(BaseModel):
@@ -86,6 +86,35 @@ class UIMessage(BaseModel):
     id: str | None = None
     role: Literal["user", "assistant", "system"]
     parts: list[MessagePart]
+    content: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_message_parts(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+
+        if "parts" in data:
+            return data
+
+        content = data.get("content")
+        if content is None:
+            return data
+
+        if isinstance(content, str):
+            normalized = dict(data)
+            normalized["parts"] = [{"type": "text", "text": content}]
+            return normalized
+
+        if isinstance(content, list):
+            normalized = dict(data)
+            normalized["parts"] = [
+                {"type": "text", "text": item} if isinstance(item, str) else item
+                for item in content
+            ]
+            return normalized
+
+        return data
 
 
 class CreateThreadRequest(BaseModel):

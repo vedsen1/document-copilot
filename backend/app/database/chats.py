@@ -71,6 +71,7 @@ async def list_threads(client: AsyncClient, user: CurrentUser) -> list[ThreadRes
 
 
 async def create_thread(
+    
     client: AsyncClient,
     user: CurrentUser,
     *,
